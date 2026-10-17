@@ -1,3 +1,169 @@
+import json
+import random
+import time
+import gevent
+import locust
+from locust import User, task, events, constant_throughput
+import websocket
+
+# Averages up to 10 seconds of audio when played, depends on the voice speed
+DEFAULT_TEXT = (
+    "Hello, this is a test message. I am testing if a long input will cause issues for the model "
+    "like this sentence. "
+)
+
+TEXT_ARRAY = [
+    "Hello.",
+    "Hello, this is a test message.",
+    DEFAULT_TEXT,
+    DEFAULT_TEXT * 2,
+    DEFAULT_TEXT * 3
+]
+
+# Custom command line arguments
+@events.init_command_line_parser.add_listener
+def on_parser_init(parser):
+    parser.add_argument("--api-key", default="YOUR_API_KEY", help="API key for authentication")
+    parser.add_argument("--encoding", default="mp3_22050_32", help="Encoding")
+    parser.add_argument("--text", default=DEFAULT_TEXT, help="Text to use")
+    parser.add_argument("--use-text-array", default="false", help="Text to use")
+    parser.add_argument("--voice-id", default="aria", help="Text to use")
+
+
+class WebSocketTTSUser(User):
+    # Each user will send a request every 20 seconds, regardless of how long each request takes
+    wait_time = constant_throughput(0.05)
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.api_key = self.environment.parsed_options.api_key
+        self.voice_id = self.environment.parsed_options.voice_id
+        self.text = self.environment.parsed_options.text
+        self.encoding = self.environment.parsed_options.encoding
+        self.use_text_array = self.environment.parsed_options.use_text_array
+        if self.use_text_array:
+            self.text = random.choice(TEXT_ARRAY)
+        self.all_recieved = False
+
+    @task
+    def tts_task(self):
+        # Do jitter waiting of up to 1 second
+        # Users appear to be spawned every second so this ensures requests are not aligned
+        gevent.sleep(random.random())
+
+        max_wait_time = 10
+
+        # Connection details
+        uri = f"{self.environment.host}/v1/text-to-speech/{self.voice_id}/stream-input?auto_mode=true&output_format={self.encoding}"
+        headers = {"xi-api-key": self.api_key}
+
+        ws = None
+        self.all_recieved = False
+        try:
+            init_msg = {"text": " "}
+            # Use proper header format for websocket - this is case sensitive!
+            ws = websocket.create_connection(uri, header=headers)
+            ws.send(json.dumps(init_msg))
+
+            # Start measuring after websocket initiated but before any messages are sent
+            send_request_time = time.perf_counter()
+            ws.send(json.dumps({"text": self.text}))
+
+            # Send to flush and receive the audio
+            ws.send(json.dumps({"text": ""}))
+
+            def _receive():
+                t_first_response = None
+                audio_size = 0
+                try:
+                    while True:
+                        # Wait up to 10 seconds for a response
+                        ws.settimeout(max_wait_time)
+                        response = ws.recv()
+                        response_data = json.loads(response)
+
+                        if "audio" in response_data and response_data["audio"]:
+                            audio_size = audio_size + len(response_data["audio"])
+
+                        if t_first_response is None:
+                            t_first_response = time.perf_counter()
+                            first_byte_ms = (
+                                t_first_response - send_request_time
+                            ) * 1000
+                            if audio_size is None:
+                                # The first response should always have audio
+                                locust.events.request.fire(
+                                    request_type="websocket",
+                                    name="Bad Response (no audio)",
+                                    response_time=first_byte_ms,
+                                    response_length=audio_size,
+                                    exception=Exception("Response has no audio"),
+                                )
+                                break
+
+                        if "isFinal" in response_data and response_data["isFinal"]:
+                            # Fire this event once finished streaming, but report the important TTFB metric
+                            locust.events.request.fire(
+                                request_type="websocket",
+                                name="TTS Stream Success (First Byte)",
+                                response_time=first_byte_ms,
+                                response_length=audio_size,
+                                exception=None,
+                            )
+                            break
+
+                except websocket.WebSocketTimeoutException:
+                    locust.events.request.fire(
+                        request_type="websocket",
+                        name="TTS Stream Timeout",
+                        response_time=max_wait_time * 1000,
+                        response_length=audio_size,
+                        exception=Exception("Timeout waiting for response"),
+                    )
+                except Exception as e:
+                    # Typically JSON decode error if the server returns HTTP backoff error
+                    locust.events.request.fire(
+                        request_type="websocket",
+                        name="TTS Stream Failure",
+                        response_time=0,
+                        response_length=0,
+                        exception=e,
+                    )
+                finally:
+                    self.all_recieved = True
+
+            gevent.spawn(_receive)
+
+            # Sleep until recieved so new tasks aren't spawned
+            while not self.all_recieved:
+                gevent.sleep(1)
+
+        except websocket.WebSocketTimeoutException:
+            locust.events.request.fire(
+                request_type="websocket",
+                name="TTS Stream Timeout",
+                response_time=max_wait_time * 1000,
+                response_length=0,
+                exception=Exception("Timeout waiting for response"),
+            )
+        except Exception as e:
+            locust.events.request.fire(
+                request_type="websocket",
+                name="TTS Stream Failure",
+                response_time=0,
+                response_length=0,
+                exception=e,
+            )
+        finally:
+            # Try and close the websocket gracefully
+            try:
+                if ws:
+                    ws.close()
+            except Exception:
+                pass
+
+
+
 ![LOGO](/logo.png)
 
 # ElevenLabs Skills
@@ -77,3 +243,4 @@ Requires the [Cursor Agent CLI](https://cursor.com/docs/cli/using) (`cursor-agen
 ## License
 
 MIT
+https://elevenlabs.io/docs/overview/models#intended-purpose
